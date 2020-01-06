@@ -210,8 +210,19 @@ class GetReports(object):
         if not os.path.exists('reports'):
             os.makedirs('reports')
 
+        logging.info('Gathering data for depratment - {}, it will not take more than a minute'.format(department))
+        if department != 'common':
+            all_instances = self.get_instances_per_department(department)
+            if len(all_instances) == 0:
+                logging.info('No instances found for department {}'.format(department))
+                exit(0)
+
+        else:
+            all_instances = self.get_all_instances()
+
         nested_department = department.replace(" ", "")
-        workbook = xlsxwriter.Workbook('reports/AWS-report-{0}-{1}-({2}).xlsx'.format(nested_department, account_id, date))
+        workbook = xlsxwriter.Workbook(
+            'reports/AWS-report-{0}-{1}-({2}).xlsx'.format(nested_department, account_id, date))
         worksheet = workbook.add_worksheet()
         head_red = workbook.add_format({'bold': True, 'font_color': 'red', 'font_size': 16, 'bg_color': '#D8D9DC'})
         head_brown = workbook.add_format({'bold': True, 'font_color': 'brown', 'font_size': 16, 'bg_color': '#D8D9DC'})
@@ -257,14 +268,6 @@ class GetReports(object):
         worksheet.write('Q1', 'Block devices size (GB)', head_red)
 
         line = 2
-
-        logging.info('Gathering data for depratment - {}, it will not take more than a minute'.format(department))
-        if department != 'common':
-            all_instances = self.get_instances_per_department(department)
-        else:
-            all_instances = self.get_all_instances()
-
-        # pprint(all_instances)
 
         logging.info('Building excel...')
         for instance in all_instances:

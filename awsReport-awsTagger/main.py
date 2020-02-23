@@ -9,6 +9,7 @@ import boto3
 import logging
 import datetime
 import xlsxwriter
+from kubernetes import client, config
 
 # Common
 date = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -152,8 +153,8 @@ class GetReports(object):
         res = []
         all_regions = self.get_all_regions()
         for region in all_regions:
-            client = boto3.client("ec2", region)
-            for group in client.describe_instances()['Reservations']:
+            ec2_client = boto3.client("ec2", region)
+            for group in ec2_client.describe_instances()['Reservations']:
                 for instance in group['Instances']:
                     volumes_price = 0
                     instance_price = 0
@@ -216,7 +217,6 @@ class GetReports(object):
             if len(all_instances) == 0:
                 logging.info('No instances found for department {}'.format(department))
                 exit(0)
-
         else:
             all_instances = self.get_all_instances()
 
@@ -380,6 +380,162 @@ class UpdateTags(object):
                 exit(1)
 
 
+# Class for kubernetes reports flow
+class GetReportKubernetes(object):
+    def __init__(self):
+        config.load_kube_config()
+        self.v1 = client.CoreV1Api()
+
+    @staticmethod
+    def cluster_name():
+        return config.list_kube_config_contexts()[1]['name'].split(".")[0]
+
+    def get_all_namespaces(self):
+        ret = self.v1.list_namespace()
+        namespaces = []
+        for namespace in ret.items:
+            namespaces.append(namespace.metadata.name)
+        return namespaces
+
+    def get_pod_resources(self, namespace, pod_name):
+        ret = self.v1.read_namespaced_pod(namespace=namespace, name=pod_name)
+        return ret.spec.containers[0].resources.requests
+
+    # Price per CPU
+    @staticmethod
+    def get_price_per_cpu(cpu):
+        one_cpu_price = 63  # price for 1 vCPU RAM in $
+        cpu = cpu / 1000
+        price = cpu * one_cpu_price
+        return round(price, 1)
+
+    # Price per RAM
+    @staticmethod
+    def get_price_per_ram(ram):
+        one_gb_ram_price = 16  # price for 1Gb RAM in $
+        ram = ram / 1000
+        price = ram * one_gb_ram_price
+        return round(price, 1)
+
+    def structured_data(self):
+        result = []
+        for namespace in self.get_all_namespaces():
+
+            endpoints = self.v1.list_namespaced_endpoints(watch=False, namespace=namespace)
+            for service in endpoints.items:
+                if 'headless' in service.metadata.name:
+                    continue
+                labels = service.metadata.labels
+                if labels is not None and 'owner' in labels:
+                    owner_label = labels['owner']
+                else:
+                    owner_label = 'Not set'
+                if service.subsets is not None:
+                    pod_names = []
+                    for subset in service.subsets:
+                        if subset.addresses is not None:
+                            for pod in subset.addresses:
+                                if pod.target_ref is not None:
+                                    pod_names.append(pod.target_ref.name)
+                    # pod_resources = None
+                    if len(pod_names) != 0:
+                        pod_resources = self.get_pod_resources(namespace=namespace, pod_name=pod_names[0])
+                        if pod_resources is not None:
+                            result.append([{'service-name': service.metadata.name},
+                                           {'pods': pod_names},
+                                           {'namespace': service.metadata.namespace},
+                                           {'one_pod_resource': pod_resources},
+                                           {'owner': owner_label}
+                                           ])
+        return result
+
+    # Pretty CPU:
+    @staticmethod
+    def pretty_cpu(cpu):
+        if 'm' in cpu:
+            cpu = cpu[0:-1]
+        else:
+            cpu = cpu + '000'
+
+        return int(cpu)
+
+    # Pretty RAM
+    @staticmethod
+    def pretty_ram(ram):
+        if 'Mi' in ram:
+            ram = ram[0:-2]
+        if 'Gi' in ram:
+            ram = ram[0:-2] + '000'
+
+        return int(ram)
+
+    # Creating excel
+    def get_report_excel(self):
+        if not os.path.exists('reports'):
+            os.makedirs('reports')
+
+        workbook = xlsxwriter.Workbook(
+            'reports/kube-report-({0})-({1}).xlsx'.format(self.cluster_name(), date))
+        worksheet = workbook.add_worksheet()
+        head_red = workbook.add_format({'bold': True, 'font_color': 'red', 'font_size': 16, 'bg_color': '#D8D9DC'})
+
+        alignment = workbook.add_format({'align': 'left'})
+        alignment_center = workbook.add_format({'align': 'center'})
+
+        worksheet.autofilter('A1:J1')
+
+        worksheet.set_column('A:A', 45)
+        worksheet.set_column('B:B', 30)
+        worksheet.set_column('C:C', 10)
+        worksheet.set_column('D:D', 15)
+        worksheet.set_column('E:E', 15)
+        worksheet.set_column('F:F', 15)
+        worksheet.set_column('G:G', 20)
+        worksheet.set_column('H:H', 20)
+        worksheet.set_column('I:I', 25)
+        worksheet.set_column('J:J', 25)
+
+        worksheet.write('A1', 'Service Name', head_red)
+        worksheet.write('B1', 'Namespace', head_red)
+        worksheet.write('C1', 'Owner', head_red)
+        worksheet.write('D1', 'Number of pods', head_red)
+        worksheet.write('E1', 'CPU (one pod)', head_red)
+        worksheet.write('F1', 'RAM (one pod)', head_red)
+        worksheet.write('G1', 'CPU (total)', head_red)
+        worksheet.write('H1', 'RAM (total)', head_red)
+        worksheet.write('I1', 'Price per CPU (USD)', head_red)
+        worksheet.write('J1', 'Price per RAM (USD)', head_red)
+
+        line = 2
+
+        logging.info('Building excel...')
+        all_data = self.structured_data()
+        for instance in all_data:
+            pod_number = len(instance[1]['pods'])
+            cpu = self.pretty_cpu(instance[3]['one_pod_resource']['cpu'])
+            ram = self.pretty_ram(instance[3]['one_pod_resource']['memory'])
+            total_cpu = pod_number * cpu
+            total_ram = pod_number * ram
+            owner = instance[4]['owner']
+            price_per_cpu = self.get_price_per_cpu(total_cpu)
+            price_per_ram = self.get_price_per_ram(total_ram)
+
+            worksheet.write('A{}'.format(line), instance[0]['service-name'], alignment)
+            worksheet.write('B{}'.format(line), str(instance[2]['namespace']), alignment)
+            worksheet.write('C{}'.format(line), owner, alignment_center)
+            worksheet.write('D{}'.format(line), pod_number, alignment_center)
+            worksheet.write('E{}'.format(line), cpu, alignment)
+            worksheet.write('F{}'.format(line), ram, alignment)
+            worksheet.write('G{}'.format(line), total_cpu, alignment)
+            worksheet.write('H{}'.format(line), total_ram, alignment)
+            worksheet.write('I{}'.format(line), price_per_cpu, alignment_center)
+            worksheet.write('J{}'.format(line), price_per_ram, alignment_center)
+
+            line += 1
+
+        workbook.close()
+
+
 # Main
 @click.command()
 @click.argument('profile')
@@ -408,21 +564,25 @@ def main(profile, flow, filename, department='common'):
 
     FLOW
 
-        Could be: report or update_tags
+        Could be: report, update_tags, kube-report
 
     Examples:
 
     1. Will generate report for all EC2 instances for profile stage
 
-        tag_optimizer stage report
+        main.py stage report
 
     2. Will generate report for particular department for profile stage
 
-        tag_optimizer stage report -d <interested you department>
+        main.py stage report -d <interested you department>
 
     3. Generate report with previous commands, fill tags, update it this way for profile stage
 
-        tag_optimizer stage update_tags -f reports/AWS-report-common-xxxxxxxxx-(xxxx-yy-zz).xlsx
+        main.py stage update_tags -f reports/AWS-report-common-xxxxxxxxx-(xxxx-yy-zz).xlsx
+
+    4. Get report for kubernetes
+
+        main.py stage kube-report    
 
     Enjoy!
 
@@ -448,8 +608,12 @@ def main(profile, flow, filename, department='common'):
         logging.info('Updating tags from file - {}'.format(filename))
         tags = UpdateTags(filename)
         tags.update_tags()
+    elif flow == 'kube-report':
+        logging.info('Generating kub-report')
+        kub_report = GetReportKubernetes()
+        kub_report.get_report_excel()
     else:
-        logging.info('Not existing flow - {}, valid flows are: report, update_tags'.format(flow))
+        logging.info('Not existing flow - {}, valid flows are: report, update_tags, kube-report'.format(flow))
         exit(1)
 
     logging.info('Done')
